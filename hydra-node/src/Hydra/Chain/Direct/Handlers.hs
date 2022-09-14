@@ -21,10 +21,8 @@ import Data.Sequence.Strict (StrictSeq)
 import Hydra.Cardano.Api (
   ChainPoint (..),
   LedgerEra,
-  PaymentKey,
   SlotNo,
   Tx,
-  VerificationKey,
   fromConsensusPointHF,
   fromLedgerTx,
   fromLedgerTxIn,
@@ -40,19 +38,17 @@ import Hydra.Chain (
   PostTxError (..),
  )
 import Hydra.Chain.Direct.State (
-  SomeOnChainHeadState (..),
-  TokHeadState (..),
+  ChainState (Closed, Idle, Initial, Open),
+  IdleState (IdleState, ctx),
   abort,
   close,
   collect,
   commit,
   contest,
   fanout,
-  getContestationDeadline,
   getKnownUTxO,
   initialize,
   observeSomeTx,
-  reifyState,
  )
 import Hydra.Chain.Direct.TimeHandle (TimeHandle (..))
 import Hydra.Chain.Direct.Util (Block, SomePoint (..))
@@ -63,7 +59,6 @@ import Hydra.Chain.Direct.Wallet (
   getFuelUTxO,
   getTxId,
  )
-import Hydra.Data.ContestationPeriod (posixToUTCTime)
 import Hydra.Logging (Tracer, traceWith)
 import Ouroboros.Consensus.Cardano.Block (HardForkBlock (BlockBabbage))
 import Ouroboros.Consensus.Shelley.Ledger (ShelleyBlock (..))
@@ -90,31 +85,30 @@ type SubmitTx m = ValidatedTx LedgerEra -> m ()
 mkChain ::
   (MonadSTM m, MonadTimer m, MonadThrow (STM m)) =>
   Tracer m DirectChainLog ->
+  -- | Means to acquire a new 'TimeHandle'.
   m TimeHandle ->
-  [VerificationKey PaymentKey] ->
   TinyWallet m ->
-  TVar m SomeOnChainHeadStateAt ->
+  TVar m ChainStateAt ->
   SubmitTx m ->
   Chain Tx m
-mkChain tracer queryTimeHandle cardanoKeys wallet headState submitTx =
+mkChain tracer queryTimeHandle wallet headState submitTx =
   Chain
     { postTx = \tx -> do
         traceWith tracer $ ToPost{toPost = tx}
         timeHandle <- queryTimeHandle
         vtx <-
           atomically
-            ( -- FIXME (MB): 'cardanoKeys' should really not be here. They
-              -- are only required for the init transaction and ought to
+            ( -- FIXME (MB): cardano keys should really not be here (as this
+              -- point they are in the 'headState' stored in the 'ChainContext')
+              -- . They are only required for the init transaction and ought to
               -- come from the _client_ and be part of the init request
-              -- altogether. This goes in the direction of 'dynamic
-              -- heads' where participants aren't known upfront but
-              -- provided via the API. Ultimately, an init request from
-              -- a client would contain all the details needed to
-              -- establish connection to the other peers and to
-              -- bootstrap the init transaction.
-              -- For now, we bear with it and keep the static keys in
-              -- context.
-              fromPostChainTx timeHandle cardanoKeys wallet headState tx
+              -- altogether. This goes in the direction of 'dynamic heads' where
+              -- participants aren't known upfront but provided via the API.
+              -- Ultimately, an init request from a client would contain all the
+              -- details needed to establish connection to the other peers and
+              -- to bootstrap the init transaction. For now, we bear with it and
+              -- keep the static keys in context.
+              fromPostChainTx timeHandle wallet headState tx
                 >>= finalizeTx wallet headState . toLedgerTx
             )
         submitTx vtx
@@ -124,12 +118,12 @@ mkChain tracer queryTimeHandle cardanoKeys wallet headState submitTx =
 finalizeTx ::
   (MonadSTM m, MonadThrow (STM m)) =>
   TinyWallet m ->
-  TVar m SomeOnChainHeadStateAt ->
+  TVar m ChainStateAt ->
   ValidatedTx LedgerEra ->
   STM m (ValidatedTx LedgerEra)
 finalizeTx TinyWallet{sign, getUTxO, coverFee} headState partialTx = do
-  someSt <- currentOnChainHeadState <$> readTVar headState
-  let headUTxO = (\(SomeOnChainHeadState st) -> getKnownUTxO st) someSt
+  someSt <- currentChainState <$> readTVar headState
+  let headUTxO = getKnownUTxO someSt
   walletUTxO <- fromLedgerUTxO . Ledger.UTxO <$> getUTxO
   coverFee (Ledger.unUTxO $ toLedgerUTxO headUTxO) partialTx >>= \case
     Left ErrUnknownInput{input} -> do
@@ -160,8 +154,8 @@ finalizeTx TinyWallet{sign, getUTxO, coverFee} headState partialTx = do
 -- pointing to the previous chain state; This allows to easily rewind the state
 -- to a point in the past when rolling backward due to a change of chain fork by
 -- our local cardano-node.
-data SomeOnChainHeadStateAt = SomeOnChainHeadStateAt
-  { currentOnChainHeadState :: SomeOnChainHeadState
+data ChainStateAt = ChainStateAt
+  { currentChainState :: ChainState
   , recordedAt :: RecordedAt
   }
   deriving (Eq, Show)
@@ -170,33 +164,46 @@ data SomeOnChainHeadStateAt = SomeOnChainHeadStateAt
 -- simply exist out of any chain events (e.g. the 'Idle' state).
 data RecordedAt
   = AtStart
-  | AtPoint ChainPoint SomeOnChainHeadStateAt
+  | AtPoint ChainPoint ChainStateAt
   deriving (Eq, Show)
 
 -- | A /handler/ that takes care of following the chain.
--- TODO: replace use of `Block` with `Tx`
 data ChainSyncHandler m = ChainSyncHandler
   { onRollForward :: Block -> m ()
   , onRollBackward :: Point Block -> m ()
   }
+
+-- | Conversion of a slot number to a time failed. This can be usually be
+-- considered an internal error and may be happening because the used era
+-- history is too old.
+data TimeConversionException = TimeConversionException
+  { slotNo :: SlotNo
+  , reason :: Text
+  }
+  deriving (Eq, Show, Exception)
 
 -- | Creates a `ChainSyncHandler` that can notify the given `callback` of events happening
 -- on-chain.
 --
 -- This forms the other half of a `ChainComponent` along with `mkChain` but is decoupled from
 -- actual interactions with the chain.
+--
+-- Throws 'TimeConversionException' when a received block's 'SlotNo' cannot be
+-- converted to a 'UTCTime' with the given 'TimeHandle'.
 chainSyncHandler ::
   forall m.
-  (MonadSTM m, MonadTime m) =>
+  (MonadSTM m, MonadThrow m) =>
   -- | Tracer for logging
   Tracer m DirectChainLog ->
   -- | Chain callback
   (ChainEvent Tx -> m ()) ->
   -- | On-chain head-state.
-  TVar m SomeOnChainHeadStateAt ->
+  TVar m ChainStateAt ->
+  -- | A handle on time to do `SlotNo -> POSIXTime` conversions for 'Tick' events.
+  TimeHandle ->
   -- | A chain-sync handler to use in a local-chain-sync client.
   ChainSyncHandler m
-chainSyncHandler tracer callback headState =
+chainSyncHandler tracer callback headState timeHandle =
   ChainSyncHandler
     { onRollBackward
     , onRollForward
@@ -211,36 +218,39 @@ chainSyncHandler tracer callback headState =
 
   onRollForward :: Block -> m ()
   onRollForward blk = do
+    let point = blockPoint blk
+    traceWith tracer $ RolledForward $ SomePoint point
+
+    let chainPoint = fromConsensusPointHF point
+        slotNo = case chainPoint of
+          ChainPointAtGenesis -> 0
+          ChainPoint s _ -> s
+    case slotToUTCTime timeHandle slotNo of
+      Left reason ->
+        throwIO TimeConversionException{slotNo, reason}
+      Right utcTime ->
+        callback (Tick utcTime)
+
     let receivedTxs = toList $ getBabbageTxs blk
-    now <- getCurrentTime
-    onChainTxs <- reverse <$> atomically (foldM (withNextTx now (blockPoint blk)) [] receivedTxs)
+    onChainTxs <- reverse <$> atomically (foldM (withNextTx chainPoint) [] receivedTxs)
     unless (null receivedTxs) $
       traceWith tracer $
         ReceivedTxs
           { onChainTxs
-          , receivedTxs = map (\tx -> (getTxId tx, tx)) receivedTxs
+          , receivedTxs = map getTxId receivedTxs
           }
     mapM_ (callback . Observation) onChainTxs
 
-  -- NOTE: We pass 'now' or current time because we need it for observing passing of time in the
-  -- contestation phase.
-  withNextTx :: UTCTime -> Point Block -> [OnChainTx Tx] -> ValidatedTx LedgerEra -> STM m [OnChainTx Tx]
-  withNextTx now point observed (fromLedgerTx -> tx) = do
+  withNextTx :: ChainPoint -> [OnChainTx Tx] -> ValidatedTx LedgerEra -> STM m [OnChainTx Tx]
+  withNextTx point observed (fromLedgerTx -> tx) = do
     st <- readTVar headState
-    case observeSomeTx tx (currentOnChainHeadState st) of
-      Just (onChainTx, st'@(SomeOnChainHeadState nextState)) -> do
+    case observeSomeTx tx (currentChainState st) of
+      Just (event, st') -> do
         writeTVar headState $
-          SomeOnChainHeadStateAt
-            { currentOnChainHeadState = st'
-            , recordedAt = AtPoint (fromConsensusPointHF point) st
+          ChainStateAt
+            { currentChainState = st'
+            , recordedAt = AtPoint point st
             }
-        -- FIXME: The right thing to do is probably to decouple the observation from the
-        -- transformation into an `OnChainTx`
-        let event = case (onChainTx, reifyState nextState) of
-              (OnCloseTx{snapshotNumber}, TkClosed) ->
-                let remainingTimeWithBuffer = 1 + diffUTCTime (posixToUTCTime $ getContestationDeadline nextState) now
-                 in OnCloseTx{snapshotNumber, remainingContestationPeriod = remainingTimeWithBuffer}
-              _ -> onChainTx
         pure $ event : observed
       Nothing ->
         pure observed
@@ -252,7 +262,7 @@ chainSyncHandler tracer callback headState =
 -- that needs to be discarded given some rollback 'chainPoint'. This depth is used
 -- in 'Hydra.HeadLogic.rollback' to discard corresponding off-chain state. Consequently
 -- the two states /must/ be kept in sync in order for rollbacks to be handled properly.
-rollback :: ChainPoint -> SomeOnChainHeadStateAt -> (SomeOnChainHeadStateAt, Word)
+rollback :: ChainPoint -> ChainStateAt -> (ChainStateAt, Word)
 rollback chainPoint = backward 0
  where
   backward n st =
@@ -272,28 +282,27 @@ closeGraceTime = 100
 fromPostChainTx ::
   (MonadSTM m, MonadThrow (STM m)) =>
   TimeHandle ->
-  [VerificationKey PaymentKey] ->
   TinyWallet m ->
-  TVar m SomeOnChainHeadStateAt ->
+  TVar m ChainStateAt ->
   PostChainTx Tx ->
   STM m Tx
-fromPostChainTx timeHandle cardanoKeys wallet someHeadState tx = do
+fromPostChainTx timeHandle wallet someHeadState tx = do
   pointInTime <- throwLeft currentPointInTime
-  SomeOnChainHeadState st <- currentOnChainHeadState <$> readTVar someHeadState
-  case (tx, reifyState st) of
-    (InitTx params, TkIdle) -> do
+  cst <- currentChainState <$> readTVar someHeadState
+  case (tx, cst) of
+    (InitTx params, Idle IdleState{ctx}) ->
       getFuelUTxO wallet >>= \case
         Just (fromLedgerTxIn -> seedInput, _) -> do
-          pure $ initialize params cardanoKeys seedInput st
+          pure $ initialize ctx params seedInput
         Nothing ->
           throwIO (NoSeedInput @Tx)
-    (AbortTx{}, TkInitialized) -> do
-      pure (abort st)
+    (AbortTx{}, Initial st) ->
+      pure $ abort st
     -- NOTE / TODO: 'CommitTx' also contains a 'Party' which seems redundant
     -- here. The 'Party' is already part of the state and it is the only party
     -- which can commit from this Hydra node.
-    (CommitTx{committed}, TkInitialized) -> do
-      either throwIO pure (commit committed st)
+    (CommitTx{committed}, Initial st) ->
+      either throwIO pure (commit st committed)
     -- TODO: We do not rely on the utxo from the collect com tx here because the
     -- chain head-state is already tracking UTXO entries locked by commit scripts,
     -- and thus, can re-construct the committed UTXO for the collectComTx from
@@ -301,27 +310,23 @@ fromPostChainTx timeHandle cardanoKeys wallet someHeadState tx = do
     --
     -- Perhaps we do want however to perform some kind of sanity check to ensure
     -- that both states are consistent.
-    (CollectComTx{}, TkInitialized) -> do
-      pure (collect st)
-    (CloseTx{confirmedSnapshot}, TkOpen) -> do
+    (CollectComTx{}, Initial st) ->
+      pure $ collect st
+    (CloseTx{confirmedSnapshot}, Open st) -> do
       shifted <- throwLeft $ adjustPointInTime closeGraceTime pointInTime
-      pure (close confirmedSnapshot shifted st)
-    (ContestTx{confirmedSnapshot}, TkClosed) -> do
+      pure (close st confirmedSnapshot shifted)
+    (ContestTx{confirmedSnapshot}, Closed st) -> do
       shifted <- throwLeft $ adjustPointInTime closeGraceTime pointInTime
-      pure (contest confirmedSnapshot shifted st)
-    (FanoutTx{utxo}, TkClosed) -> do
-      -- NOTE: It's a bit weird that we inspect the state here, but handling
-      -- errors around while we want the possibly failing "time -> slot"
-      -- conversion to be done here is not prettier.
-      deadlineSlot <- throwLeft . slotFromPOSIXTime $ getContestationDeadline st
-      pure (fanout utxo deadlineSlot st)
-    (_, _) ->
-      throwIO $ InvalidStateToPost tx
+      pure (contest st confirmedSnapshot shifted)
+    (FanoutTx{utxo, contestationDeadline}, Closed st) -> do
+      deadlineSlot <- throwLeft $ slotFromUTCTime contestationDeadline
+      pure (fanout st utxo deadlineSlot)
+    (_, _) -> throwIO $ InvalidStateToPost tx
  where
   -- XXX: Might want a dedicated exception type here
   throwLeft = either (throwSTM . userError . toString) pure
 
-  TimeHandle{currentPointInTime, adjustPointInTime, slotFromPOSIXTime} = timeHandle
+  TimeHandle{currentPointInTime, adjustPointInTime, slotFromUTCTime} = timeHandle
 
 --
 -- Helpers
@@ -342,9 +347,11 @@ getBabbageTxs = \case
 
 data DirectChainLog
   = ToPost {toPost :: PostChainTx Tx}
-  | PostingTx {postedTx :: (Ledger.TxId StandardCrypto, ValidatedTx LedgerEra)}
-  | PostedTx {postedTxId :: Ledger.TxId StandardCrypto}
-  | ReceivedTxs {onChainTxs :: [OnChainTx Tx], receivedTxs :: [(Ledger.TxId StandardCrypto, ValidatedTx LedgerEra)]}
+  | PostingTx {txId :: Ledger.TxId StandardCrypto}
+  | PostedTx {txId :: Ledger.TxId StandardCrypto}
+  | PostingFailed {tx :: ValidatedTx LedgerEra, postTxError :: PostTxError Tx}
+  | ReceivedTxs {onChainTxs :: [OnChainTx Tx], receivedTxs :: [Ledger.TxId StandardCrypto]}
+  | RolledForward {point :: SomePoint}
   | RolledBackward {point :: SomePoint}
   | Wallet TinyWalletLog
   deriving (Eq, Show, Generic)

@@ -25,13 +25,13 @@ import Hydra.Chain.Direct.Contract.CollectCom (genCollectComMutation, healthyCol
 import Hydra.Chain.Direct.Contract.Commit (genCommitMutation, healthyCommitTx)
 import Hydra.Chain.Direct.Contract.Contest (genContestMutation, healthyContestTx)
 import Hydra.Chain.Direct.Contract.FanOut (genFanoutMutation, healthyFanoutTx)
-import Hydra.Chain.Direct.Contract.Init (genHealthyIdleSt, genInitMutation, genObserveInitMutation, healthyInitTx)
+import Hydra.Chain.Direct.Contract.Init (genHealthyIdleState, genInitMutation, genObserveInitMutation, healthyInitTx)
 import Hydra.Chain.Direct.Contract.Mutation (
   propMutationOffChain,
   propMutationOnChain,
   propTransactionValidates,
  )
-import Hydra.Chain.Direct.State (SomeOnChainHeadState (..))
+import Hydra.Chain.Direct.State (ChainState (Idle))
 import qualified Hydra.Contract.Commit as Commit
 import Hydra.Contract.Head (
   verifyPartySignature,
@@ -91,7 +91,7 @@ spec = parallel $ do
     prop "does not survive random adversarial mutations (on-chain)" $
       propMutationOnChain healthyInitTx genInitMutation
     prop "does not survive random adversarial mutations (off-chain)" $
-      propMutationOffChain healthyInitTx genObserveInitMutation (SomeOnChainHeadState <$> genHealthyIdleSt)
+      propMutationOffChain healthyInitTx genObserveInitMutation (Idle <$> genHealthyIdleState)
 
   describe "Abort" $ do
     prop "is healthy" $

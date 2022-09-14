@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               hydra-node
-version:            0.7.0
+version:            0.8.0
 synopsis:           The Hydra node
 author:             IOG
 copyright:          2022 IOG
@@ -194,6 +194,22 @@ executable hydra-node
 
   ghc-options:    -threaded -rtsopts
 
+executable hydra-tools
+  import:         project-config
+  hs-source-dirs: exe/hydra-tools
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , bytestring
+    , cryptonite
+    , filepath
+    , hydra-cardano-api
+    , hydra-node
+    , hydra-prelude
+    , optparse-applicative
+
+  ghc-options:    -threaded -rtsopts
+
 benchmark tx-cost
   import:         project-config
   hs-source-dirs: exe/tx-cost
@@ -249,8 +265,10 @@ test-suite tests
     Hydra.Chain.Direct.Contract.Mutation
     Hydra.Chain.Direct.ContractSpec
     Hydra.Chain.Direct.Fixture
+    Hydra.Chain.Direct.HandlersSpec
     Hydra.Chain.Direct.ScriptRegistrySpec
     Hydra.Chain.Direct.StateSpec
+    Hydra.Chain.Direct.TimeHandleSpec
     Hydra.Chain.Direct.TxSpec
     Hydra.Chain.Direct.WalletSpec
     Hydra.ClientInputSpec

@@ -9,11 +9,11 @@ import CardanoClient (queryTip)
 import CardanoNode (RunningNode (..))
 import Control.Lens ((^?))
 import Data.Aeson (object, (.=))
-import Data.Aeson.Lens (key, _Number)
+import Data.Aeson.Lens (key, _JSON)
 import qualified Data.Set as Set
-import Hydra.Cardano.Api (Lovelace, selectLovelace)
-import Hydra.Cluster.Faucet (Marked (Fuel), publishHydraScriptsAs, queryMarkedUTxO, seedFromFaucet)
-import Hydra.Cluster.Fixture (Actor (Alice, Faucet), actorName, alice, aliceSk)
+import Hydra.Cardano.Api (Lovelace, TxId, selectLovelace)
+import Hydra.Cluster.Faucet (Marked (Fuel), queryMarkedUTxO, seedFromFaucet)
+import Hydra.Cluster.Fixture (Actor (Alice), actorName, alice, aliceSk)
 import Hydra.Cluster.Util (chainConfigFor, keysFor)
 import Hydra.Ledger (IsTx (balance))
 import Hydra.Ledger.Cardano (Tx)
@@ -25,16 +25,15 @@ singlePartyHeadFullLifeCycle ::
   Tracer IO EndToEndLog ->
   FilePath ->
   RunningNode ->
+  TxId ->
   IO ()
-singlePartyHeadFullLifeCycle tracer workDir node@RunningNode{networkId} = do
+singlePartyHeadFullLifeCycle tracer workDir node@RunningNode{networkId} hydraScriptsTxId = do
   refuelIfNeeded tracer node Alice 100_000_000
   -- Start hydra-node on chain tip
   tip <- queryTip networkId nodeSocket
   aliceChainConfig <-
     chainConfigFor Alice workDir nodeSocket []
       <&> \config -> config{networkId, startChainFrom = Just tip}
-  hydraScriptsTxId <- publishHydraScriptsAs node Faucet
-  traceWith tracer $ PublishedHydraScriptsAt{hydraScriptsTxId}
   withHydraNode tracer aliceChainConfig workDir 1 aliceSk [] [1] hydraScriptsTxId $ \n1 -> do
     -- Initialize & open head
     let contestationPeriod = 1 :: Natural
@@ -47,17 +46,13 @@ singlePartyHeadFullLifeCycle tracer workDir node@RunningNode{networkId} = do
       output "HeadIsOpen" ["utxo" .= object mempty]
     -- Close head
     send n1 $ input "Close" []
-    remainingSeconds <- waitMatch 600 n1 $ \v -> do
+    deadline <- waitMatch 600 n1 $ \v -> do
       guard $ v ^? key "tag" == Just "HeadIsClosed"
-      v ^? key "remainingContestationPeriod" . _Number
-    -- Expect to see readyToFanout within 10 seconds after deadline
-    waitFor tracer (truncate $ remainingSeconds + 10) [n1] $
+      v ^? key "contestationDeadline" . _JSON
+    -- Expect to see ReadyToFanout within 3 seconds after deadline
+    remainingTime <- diffUTCTime deadline <$> getCurrentTime
+    waitFor tracer (truncate $ remainingTime + 3) [n1] $
       output "ReadyToFanout" []
-    -- FIXME: Ideally the 'ReadyToFanout' is only sent when it's really ready,
-    -- but the cardano-ledger only updates it's "current slot" when it sees a
-    -- block. So we wait for roughly 1-2 blocks here (if not fixable, should at
-    -- least configure this given the shelley genesis)
-    threadDelay (2 * 20)
     send n1 $ input "Fanout" []
     waitFor tracer 600 [n1] $
       output "HeadIsFinalized" ["utxo" .= object mempty]

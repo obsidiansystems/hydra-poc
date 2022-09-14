@@ -1,57 +1,26 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Hydra.Chain.Direct.State (
-  -- * OnChainHeadState
-  OnChainHeadState,
-  HeadStateKind (..),
-  HeadStateKindVal (..),
-  getKnownUTxO,
-
-  -- ** Working with opaque states
-  SomeOnChainHeadState (..),
-  TokHeadState (..),
-  reifyState,
-
-  -- ** Initializing
-  idleOnChainHeadState,
-
-  -- ** Constructing transitions
-  initialize,
-  abort,
-  commit,
-  collect,
-  close,
-  contest,
-  fanout,
-
-  -- ** Observing transitions
-  observeSomeTx,
-
-  -- *** Internal API
-  ObserveTx (..),
-  HasTransition (..),
-  TransitionFrom (..),
-  getContestationDeadline,
-) where
+module Hydra.Chain.Direct.State where
 
 import Hydra.Cardano.Api
-import Hydra.Prelude
+import Hydra.Prelude hiding (init)
 
 import qualified Cardano.Api.UTxO as UTxO
 import qualified Data.Map as Map
 import Hydra.Chain (HeadId (..), HeadParameters, OnChainTx (..), PostTxError (..))
-import Hydra.Chain.Direct.ScriptRegistry (ScriptRegistry (..), registryUTxO)
+import Hydra.Chain.Direct.ScriptRegistry (ScriptRegistry (..), genScriptRegistry, registryUTxO)
 import Hydra.Chain.Direct.TimeHandle (PointInTime)
 import Hydra.Chain.Direct.Tx (
-  AbortObservation (..),
+  AbortObservation (AbortObservation),
+  AbortTxError (OverlappingInputs),
   CloseObservation (..),
   ClosedThreadOutput (..),
   ClosingSnapshot (..),
   CollectComObservation (..),
   CommitObservation (..),
   ContestObservation (..),
-  FanoutObservation (..),
+  FanoutObservation (FanoutObservation),
   InitObservation (..),
   InitialThreadOutput (..),
   OpenThreadOutput (..),
@@ -62,6 +31,7 @@ import Hydra.Chain.Direct.Tx (
   commitTx,
   contestTx,
   fanoutTx,
+  headTokensFromValue,
   initTx,
   observeAbortTx,
   observeCloseTx,
@@ -70,195 +40,179 @@ import Hydra.Chain.Direct.Tx (
   observeContestTx,
   observeFanoutTx,
   observeInitTx,
-  ownInitial,
  )
+import Hydra.Data.ContestationPeriod (posixToUTCTime)
 import Hydra.Ledger (IsTx (hashUTxO))
+import Hydra.Ledger.Cardano (genVerificationKey)
 import Hydra.Party (Party)
 import Hydra.Snapshot (ConfirmedSnapshot (..), Snapshot (..))
-import Plutus.V2.Ledger.Api (POSIXTime)
-import qualified Text.Show
+import Test.QuickCheck (sized)
 
--- | An opaque on-chain head state, which records information and events
--- happening on the layer-1 for a given Hydra head.
-data OnChainHeadState (st :: HeadStateKind) = OnChainHeadState
+-- | A class for accessing the known 'UTxO' set in a type. This is useful to get
+-- all the relevant UTxO for resolving transaction inputs.
+class HasKnownUTxO a where
+  getKnownUTxO :: a -> UTxO
+
+-- * States & transitions
+
+-- | A definition of all transitions between 'ChainState's. Enumerable and
+-- bounded to be used as labels for checking coverage.
+data ChainTransition
+  = Init
+  | Commit
+  | Collect
+  | Close
+  | Contest
+  | Fanout
+  deriving (Eq, Show, Enum, Bounded)
+
+-- | An enumeration of all possible on-chain states of a Hydra Head, where each
+-- case stores the relevant information to construct & observe transactions to
+-- other states.
+data ChainState
+  = Idle IdleState
+  | Initial InitialState
+  | Open OpenState
+  | Closed ClosedState
+  deriving (Eq, Show)
+
+instance HasKnownUTxO ChainState where
+  getKnownUTxO :: ChainState -> UTxO
+  getKnownUTxO = \case
+    Idle st -> getKnownUTxO st
+    Initial st -> getKnownUTxO st
+    Open st -> getKnownUTxO st
+    Closed st -> getKnownUTxO st
+
+-- | Read-only chain-specific data. This is different to 'HydraContext' as it
+-- only provide contains data known to single peer.
+data ChainContext = ChainContext
   { networkId :: NetworkId
   , peerVerificationKeys :: [VerificationKey PaymentKey]
   , ownVerificationKey :: VerificationKey PaymentKey
   , ownParty :: Party
-  , stateMachine :: HydraStateMachine st
   , scriptRegistry :: ScriptRegistry
   }
-  deriving (Eq, Show)
+  deriving (Show, Eq)
 
--- NOTE (1): The state machine UTxO produced by the Init transaction (a.k.a
--- 'threadOutput') is always present and 'threaded' across all transactions.
---
--- NOTE (2): The Head's identifier is somewhat encoded in the TxOut's address
---
--- TODO: Data and [OnChain.Party] are overlapping
---
--- TODO: There are better ways to model this to avoid duplicating common fields
--- across all branches!
-data HydraStateMachine (st :: HeadStateKind) where
-  Idle :: HydraStateMachine 'StIdle
-  Initialized ::
-    { initialThreadOutput :: InitialThreadOutput
-    , initialInitials :: [UTxOWithScript]
-    , initialCommits :: [UTxOWithScript]
-    , initialHeadId :: HeadId
-    , initialHeadTokenScript :: PlutusScript
-    } ->
-    HydraStateMachine 'StInitialized
-  Open ::
-    { openThreadOutput :: OpenThreadOutput
-    , openHeadId :: HeadId
-    , openHeadTokenScript :: PlutusScript
-    , openUtxoHash :: ByteString
-    } ->
-    HydraStateMachine 'StOpen
-  Closed ::
-    { closedThreadOutput :: ClosedThreadOutput
-    , closedHeadId :: HeadId
-    , closedHeadTokenScript :: PlutusScript
-    } ->
-    HydraStateMachine 'StClosed
+instance Arbitrary ChainContext where
+  arbitrary = sized $ \n -> do
+    networkId <- Testnet . NetworkMagic <$> arbitrary
+    peerVerificationKeys <- replicateM n genVerificationKey
+    ownVerificationKey <- genVerificationKey
+    ownParty <- arbitrary
+    scriptRegistry <- genScriptRegistry
+    pure
+      ChainContext
+        { networkId
+        , peerVerificationKeys
+        , ownVerificationKey
+        , ownParty
+        , scriptRegistry
+        }
 
-deriving instance Show (HydraStateMachine st)
-deriving instance Eq (HydraStateMachine st)
+-- | Get all cardano verification keys available in the chain context.
+allVerificationKeys :: ChainContext -> [VerificationKey PaymentKey]
+allVerificationKeys ChainContext{peerVerificationKeys, ownVerificationKey} =
+  ownVerificationKey : peerVerificationKeys
 
-getKnownUTxO ::
-  OnChainHeadState st ->
-  UTxO
-getKnownUTxO OnChainHeadState{stateMachine, scriptRegistry} =
-  case stateMachine of
-    Idle{} ->
-      registryUTxO scriptRegistry
-    Initialized{initialThreadOutput = InitialThreadOutput{initialThreadUTxO}, initialInitials, initialCommits} ->
-      registryUTxO scriptRegistry <> headUtxo
-     where
-      headUtxo =
-        UTxO $
-          Map.fromList $
-            take2Of3 initialThreadUTxO : (take2Of3 <$> (initialInitials <> initialCommits))
-    Open{openThreadOutput = OpenThreadOutput{openThreadUTxO = (i, o, _)}} ->
-      registryUTxO scriptRegistry <> UTxO.singleton (i, o)
-    Closed{closedThreadOutput = ClosedThreadOutput{closedThreadUTxO = (i, o, _)}} ->
-      registryUTxO scriptRegistry <> UTxO.singleton (i, o)
+-- | The idle state does not contain any head-specific information and exists to
+-- be used as a starting and terminal state.
+newtype IdleState = IdleState {ctx :: ChainContext}
+  deriving (Show, Eq)
 
-getContestationDeadline :: OnChainHeadState 'StClosed -> POSIXTime
-getContestationDeadline
-  OnChainHeadState{stateMachine = Closed{closedThreadOutput = ClosedThreadOutput{closedContestationDeadline}}} =
-    closedContestationDeadline
+instance Arbitrary IdleState where
+  arbitrary = IdleState <$> arbitrary
 
--- Working with opaque states
+instance HasKnownUTxO IdleState where
+  getKnownUTxO IdleState{ctx = ChainContext{scriptRegistry}} =
+    registryUTxO scriptRegistry
 
--- | An existential wrapping /some/ 'OnChainHeadState' into a value that carry
--- no type-level information about the state.
-data SomeOnChainHeadState where
-  SomeOnChainHeadState ::
-    forall st.
-    (HasTransition st) =>
-    OnChainHeadState st ->
-    SomeOnChainHeadState
+data InitialState = InitialState
+  { ctx :: ChainContext
+  , initialThreadOutput :: InitialThreadOutput
+  , initialInitials :: [UTxOWithScript]
+  , initialCommits :: [UTxOWithScript]
+  , initialHeadId :: HeadId
+  , initialHeadTokenScript :: PlutusScript
+  }
+  deriving (Show, Eq)
 
-instance Show SomeOnChainHeadState where
-  show (SomeOnChainHeadState st) = show st
+instance HasKnownUTxO InitialState where
+  getKnownUTxO st =
+    registryUTxO scriptRegistry <> headUtxo
+   where
+    headUtxo =
+      UTxO $
+        Map.fromList $
+          take2Of3 initialThreadUTxO : (take2Of3 <$> (initialInitials <> initialCommits))
 
-instance Eq SomeOnChainHeadState where
-  (SomeOnChainHeadState st) == (SomeOnChainHeadState st') =
-    case (reifyState st, reifyState st') of
-      (TkIdle, TkIdle) ->
-        st == st'
-      (TkInitialized, TkInitialized) ->
-        st == st'
-      (TkOpen, TkOpen) ->
-        st == st'
-      (TkClosed, TkClosed) ->
-        st == st'
-      _ ->
-        False
+    InitialState
+      { ctx = ChainContext{scriptRegistry}
+      , initialThreadOutput = InitialThreadOutput{initialThreadUTxO}
+      , initialInitials
+      , initialCommits
+      } = st
 
--- | Some Kind for witnessing Hydra state-machine's states at the type-level.
---
--- This is useful to
---
--- (a) Reads code evolving the state machine, as it makes transition more
--- obvious from type-signatures;
--- (b) Pattern-match on the 'HydraStateMachine' without having to bother with
--- non-reachable cases.
-data HeadStateKind = StIdle | StInitialized | StOpen | StClosed
-  deriving (Eq, Show, Enum, Bounded)
+data OpenState = OpenState
+  { ctx :: ChainContext
+  , openThreadOutput :: OpenThreadOutput
+  , openHeadId :: HeadId
+  , openHeadTokenScript :: PlutusScript
+  , openUtxoHash :: ByteString
+  }
+  deriving (Show, Eq)
 
-class HeadStateKindVal (st :: HeadStateKind) where
-  headStateKindVal :: Proxy st -> HeadStateKind
+instance HasKnownUTxO OpenState where
+  getKnownUTxO st =
+    registryUTxO scriptRegistry <> UTxO.singleton (i, o)
+   where
+    OpenState
+      { ctx = ChainContext{scriptRegistry}
+      , openThreadOutput = OpenThreadOutput{openThreadUTxO = (i, o, _)}
+      } = st
 
-instance HeadStateKindVal 'StIdle where
-  headStateKindVal _ = StIdle
-instance HeadStateKindVal 'StInitialized where
-  headStateKindVal _ = StInitialized
-instance HeadStateKindVal 'StOpen where
-  headStateKindVal _ = StOpen
-instance HeadStateKindVal 'StClosed where
-  headStateKindVal _ = StClosed
+data ClosedState = ClosedState
+  { ctx :: ChainContext
+  , closedThreadOutput :: ClosedThreadOutput
+  , closedHeadId :: HeadId
+  , closedHeadTokenScript :: PlutusScript
+  }
+  deriving (Show, Eq)
 
--- | A token witnessing the state's type of an 'OnChainHeadState'. See 'reifyState'
-data TokHeadState (st :: HeadStateKind) where
-  TkIdle :: TokHeadState 'StIdle
-  TkInitialized :: TokHeadState 'StInitialized
-  TkOpen :: TokHeadState 'StOpen
-  TkClosed :: TokHeadState 'StClosed
+instance HasKnownUTxO ClosedState where
+  getKnownUTxO st =
+    registryUTxO scriptRegistry <> UTxO.singleton (i, o)
+   where
+    ClosedState
+      { ctx = ChainContext{scriptRegistry}
+      , closedThreadOutput = ClosedThreadOutput{closedThreadUTxO = (i, o, _)}
+      } = st
 
-deriving instance Show (TokHeadState st)
+-- * Constructing transactions
 
--- | Reify a 'HeadStateKind' kind into a value to enable pattern-matching on
--- existentials.
-reifyState :: forall st. OnChainHeadState st -> TokHeadState st
-reifyState OnChainHeadState{stateMachine} =
-  case stateMachine of
-    Idle{} -> TkIdle
-    Initialized{} -> TkInitialized
-    Open{} -> TkOpen
-    Closed{} -> TkClosed
-
--- Initialization
-
--- | Initialize a new 'OnChainHeadState'.
-idleOnChainHeadState ::
-  NetworkId ->
-  [VerificationKey PaymentKey] ->
-  VerificationKey PaymentKey ->
-  Party ->
-  ScriptRegistry ->
-  OnChainHeadState 'StIdle
-idleOnChainHeadState networkId peerVerificationKeys ownVerificationKey ownParty scriptRegistry =
-  OnChainHeadState
-    { networkId
-    , peerVerificationKeys
-    , ownVerificationKey
-    , ownParty
-    , scriptRegistry
-    , stateMachine = Idle
-    }
-
--- Constructing Transitions
-
--- | Initialize a head from an 'StIdle' state. This does not change the state
--- but produces a transaction which, if observed, does apply the transition.
+-- | Construct an init transaction given some general 'ChainContext', the
+-- 'HeadParameters' and a seed 'TxIn' which will be spent.
 initialize ::
+  ChainContext ->
   HeadParameters ->
-  [VerificationKey PaymentKey] ->
+  -- | Seed input.
   TxIn ->
-  OnChainHeadState 'StIdle ->
   Tx
-initialize params cardanoKeys seedInput OnChainHeadState{networkId} = do
-  initTx networkId cardanoKeys params seedInput
+initialize ctx =
+  initTx networkId (allVerificationKeys ctx)
+ where
+  ChainContext{networkId} = ctx
 
+-- | Construct a commit transaction based on the 'InitialState'. This does look
+-- for "our initial output" to spend and check the given 'UTxO' to be
+-- compatible. Hence, this function does fail if already committed.
 commit ::
+  InitialState ->
   UTxO ->
-  OnChainHeadState 'StInitialized ->
   Either (PostTxError Tx) Tx
-commit utxo st@OnChainHeadState{networkId, ownParty, ownVerificationKey, stateMachine} = do
-  case ownInitial initialHeadTokenScript ownVerificationKey initialInitials of
+commit st utxo = do
+  case ownInitial of
     Nothing ->
       Left (CannotFindOwnInitial{knownUTxO = getKnownUTxO st})
     Just initial ->
@@ -271,10 +225,27 @@ commit utxo st@OnChainHeadState{networkId, ownParty, ownVerificationKey, stateMa
         _ ->
           Left (MoreThanOneUTxOCommitted @Tx)
  where
-  Initialized
-    { initialInitials
+  InitialState
+    { ctx = ChainContext{networkId, ownParty, ownVerificationKey}
+    , initialInitials
     , initialHeadTokenScript
-    } = stateMachine
+    } = st
+
+  ownInitial :: Maybe (TxIn, TxOut CtxUTxO, Hash PaymentKey)
+  ownInitial =
+    foldl' go Nothing initialInitials
+   where
+    go (Just x) _ = Just x
+    go Nothing (i, out, _) = do
+      let vkh = verificationKeyHash ownVerificationKey
+      guard $ hasMatchingPT vkh (txOutValue out)
+      pure (i, out, vkh)
+
+  hasMatchingPT :: Hash PaymentKey -> Value -> Bool
+  hasMatchingPT vkh val =
+    case headTokensFromValue initialHeadTokenScript val of
+      [(AssetName bs, 1)] -> bs == serialiseToRawBytes vkh
+      _ -> False
 
   rejectByronAddress :: (TxIn, TxOut CtxUTxO) -> Either (PostTxError Tx) ()
   rejectByronAddress = \case
@@ -283,45 +254,57 @@ commit utxo st@OnChainHeadState{networkId, ownParty, ownVerificationKey, stateMa
     (_, TxOut ShelleyAddressInEra{} _ _ _) ->
       Right ()
 
+-- | Construct a collect transaction based on the 'InitialState'. This will
+-- reimburse all the already committed outputs.
 abort ::
   HasCallStack =>
-  OnChainHeadState 'StInitialized ->
+  InitialState ->
   Tx
-abort OnChainHeadState{ownVerificationKey, stateMachine, scriptRegistry} = do
+abort st = do
   let InitialThreadOutput{initialThreadUTxO = (i, o, dat)} = initialThreadOutput
       initials = Map.fromList $ map tripleToPair initialInitials
       commits = Map.fromList $ map tripleToPair initialCommits
-   in case abortTx scriptRegistry ownVerificationKey (i, o, dat) (initialHeadTokenScript stateMachine) initials commits of
-        Left err ->
-          -- FIXME: Exception with MonadThrow?
-          error $ show err
+   in case abortTx scriptRegistry ownVerificationKey (i, o, dat) initialHeadTokenScript initials commits of
+        Left OverlappingInputs ->
+          -- FIXME: This is a "should not happen" error. We should try to fix
+          -- the arguments of abortTx to make it impossible of having
+          -- "overlapping" inputs. But, how exactly?
+          error $ show OverlappingInputs
         Right tx ->
           tx
  where
-  Initialized
-    { initialThreadOutput
+  InitialState
+    { ctx = ChainContext{ownVerificationKey, scriptRegistry}
+    , initialThreadOutput
     , initialInitials
     , initialCommits
-    } = stateMachine
+    , initialHeadTokenScript
+    } = st
 
+-- | Construct a collect transaction based on the 'InitialState'. This will know
+-- collect all the committed outputs.
 collect ::
-  OnChainHeadState 'StInitialized ->
+  InitialState ->
   Tx
-collect OnChainHeadState{networkId, ownVerificationKey, stateMachine} = do
+collect st = do
   let commits = Map.fromList $ fmap tripleToPair initialCommits
    in collectComTx networkId ownVerificationKey initialThreadOutput commits
  where
-  Initialized
-    { initialThreadOutput
+  InitialState
+    { ctx = ChainContext{networkId, ownVerificationKey}
+    , initialThreadOutput
     , initialCommits
-    } = stateMachine
+    } = st
 
+-- | Construct a close transaction based on the 'OpenState' and a confirmed
+-- snapshot. The given 'PointInTime' will be used as an upper validity bound and
+-- will define the start of the contestation period.
 close ::
+  OpenState ->
   ConfirmedSnapshot Tx ->
   PointInTime ->
-  OnChainHeadState 'StOpen ->
   Tx
-close confirmedSnapshot pointInTime OnChainHeadState{ownVerificationKey, stateMachine} =
+close st confirmedSnapshot pointInTime =
   closeTx ownVerificationKey closingSnapshot pointInTime openThreadOutput
  where
   closingSnapshot = case confirmedSnapshot of
@@ -335,14 +318,21 @@ close confirmedSnapshot pointInTime OnChainHeadState{ownVerificationKey, stateMa
         , signatures
         }
 
-  Open{openThreadOutput, openUtxoHash} = stateMachine
+  OpenState
+    { ctx = ChainContext{ownVerificationKey}
+    , openThreadOutput
+    , openUtxoHash
+    } = st
 
+-- | Construct a contest transaction based on the 'ClosedState' and a confirmed
+-- snapshot. The given 'PointInTime' will be used as an upper validity bound and
+-- needs to be before the deadline.
 contest ::
+  ClosedState ->
   ConfirmedSnapshot Tx ->
   PointInTime ->
-  OnChainHeadState 'StClosed ->
   Tx
-contest confirmedSnapshot pointInTime OnChainHeadState{ownVerificationKey, stateMachine} = do
+contest st confirmedSnapshot pointInTime = do
   contestTx ownVerificationKey sn sigs pointInTime closedThreadOutput
  where
   (sn, sigs) =
@@ -350,308 +340,214 @@ contest confirmedSnapshot pointInTime OnChainHeadState{ownVerificationKey, state
       ConfirmedSnapshot{snapshot, signatures} -> (snapshot, signatures)
       InitialSnapshot{snapshot} -> (snapshot, mempty)
 
-  Closed{closedThreadOutput} = stateMachine
+  ClosedState
+    { ctx = ChainContext{ownVerificationKey}
+    , closedThreadOutput
+    } = st
 
+-- | Construct a fanout transaction based on the 'ClosedState' and off-chain
+-- agreed 'UTxO' set to fan out.
 fanout ::
+  ClosedState ->
   UTxO ->
   -- | Contestation deadline as SlotNo, used to set lower tx validity bound.
   SlotNo ->
-  OnChainHeadState 'StClosed ->
   Tx
-fanout utxo deadlineSlotNo OnChainHeadState{stateMachine} = do
+fanout st utxo deadlineSlotNo = do
   fanoutTx utxo (i, o, dat) deadlineSlotNo closedHeadTokenScript
  where
-  Closed{closedThreadOutput, closedHeadTokenScript} = stateMachine
+  ClosedState{closedThreadOutput, closedHeadTokenScript} = st
 
   ClosedThreadOutput{closedThreadUTxO = (i, o, dat)} = closedThreadOutput
 
--- Observing Transitions
+-- * Observing Transitions
 
--- | A class for describing a Hydra transition from a state to another.
---
--- The transition is encoded at the type-level through the `HeadStateKind` and
--- the function `transition` overloaded for all transitions.
-class
-  HasTransition st =>
-  ObserveTx (st :: HeadStateKind) (st' :: HeadStateKind)
-  where
-  observeTx ::
-    Tx ->
-    OnChainHeadState st ->
-    Maybe (OnChainTx Tx, OnChainHeadState st')
+-- | Observe a transition without knowing the starting or ending state. This
+-- function should try to observe all relevant transitions given some
+-- 'ChainState'.
+observeSomeTx :: Tx -> ChainState -> Maybe (OnChainTx Tx, ChainState)
+observeSomeTx tx = \case
+  Idle IdleState{ctx} ->
+    second Initial <$> observeInit ctx tx
+  Initial st ->
+    second Initial <$> observeCommit st tx
+      <|> second Idle <$> observeAbort st tx
+      <|> second Open <$> observeCollect st tx
+  Open st -> second Closed <$> observeClose st tx
+  Closed st ->
+    second Closed <$> observeContest st tx
+      <|> second Idle <$> observeFanout st tx
 
--- | A convenient class to declare all possible transitions from a given
--- starting state 'st'. This is useful to embed 'OnChainHeadState' with an
--- existential that carries some capabilities in the form of transitions (e.g.
--- 'SomeOnChainHeadState').
-class HasTransition (st :: HeadStateKind) where
-  transitions ::
-    Proxy st -> [TransitionFrom st]
+-- ** IdleState transitions
 
---
--- StIdle
---
-
-instance HasTransition 'StIdle where
-  transitions _ =
-    [ TransitionTo (Proxy @ 'StInitialized)
-    ]
-
-instance ObserveTx 'StIdle 'StInitialized where
-  observeTx tx OnChainHeadState{networkId, peerVerificationKeys, ownParty, ownVerificationKey, scriptRegistry} = do
-    let allVerificationKeys = ownVerificationKey : peerVerificationKeys
-    observation <- observeInitTx networkId allVerificationKeys ownParty tx
-    let InitObservation
-          { threadOutput
-          , initials
-          , commits
-          , headId
-          , headTokenScript
-          , contestationPeriod
-          , parties
-          } = observation
-    let event = OnInitTx{contestationPeriod, parties}
-    let st' =
-          OnChainHeadState
-            { networkId
-            , ownParty
-            , ownVerificationKey
-            , peerVerificationKeys
-            , scriptRegistry
-            , stateMachine =
-                Initialized
-                  { initialThreadOutput = threadOutput
-                  , initialInitials = initials
-                  , initialCommits = commits
-                  , initialHeadId = headId
-                  , initialHeadTokenScript = headTokenScript
-                  }
-            }
-    pure (event, st')
-
---
--- StInitialized
---
-
-instance HasTransition 'StInitialized where
-  transitions _ =
-    [ TransitionTo (Proxy @ 'StInitialized)
-    , TransitionTo (Proxy @ 'StOpen)
-    , TransitionTo (Proxy @ 'StIdle)
-    ]
-
-instance ObserveTx 'StInitialized 'StInitialized where
-  observeTx tx st@OnChainHeadState{networkId, stateMachine} = do
-    let initials = fst3 <$> initialInitials
-    observation <- observeCommitTx networkId initials tx
-    let CommitObservation{commitOutput, party, committed} = observation
-    let event = OnCommitTx{party, committed}
-    let st' =
-          st
-            { stateMachine =
-                stateMachine
-                  { initialInitials =
-                      -- NOTE: A commit tx has been observed and thus we can
-                      -- remove all it's inputs from our tracked initials
-                      filter ((`notElem` txIns' tx) . fst3) initialInitials
-                  , initialCommits =
-                      commitOutput : initialCommits
-                  }
-            }
-    pure (event, st')
-   where
-    Initialized
-      { initialCommits
-      , initialInitials
-      } = stateMachine
-
-instance ObserveTx 'StInitialized 'StOpen where
-  observeTx tx st@OnChainHeadState{networkId, peerVerificationKeys, ownVerificationKey, ownParty, stateMachine, scriptRegistry} = do
-    let utxo = getKnownUTxO st
-    observation <- observeCollectComTx utxo tx
-    let CollectComObservation{threadOutput, headId, utxoHash} = observation
-    guard (headId == initialHeadId)
-    let event = OnCollectComTx
-    let st' =
-          OnChainHeadState
-            { networkId
-            , peerVerificationKeys
-            , ownVerificationKey
-            , ownParty
-            , scriptRegistry
-            , stateMachine =
-                Open
-                  { openThreadOutput = threadOutput
-                  , openHeadId = initialHeadId
-                  , openHeadTokenScript = initialHeadTokenScript
-                  , openUtxoHash = utxoHash
-                  }
-            }
-    pure (event, st')
-   where
-    Initialized
-      { initialHeadId
-      , initialHeadTokenScript
-      } = stateMachine
-
-instance ObserveTx 'StInitialized 'StIdle where
-  observeTx tx st@OnChainHeadState{networkId, peerVerificationKeys, ownVerificationKey, ownParty, scriptRegistry} = do
-    let utxo = getKnownUTxO st
-    AbortObservation <- observeAbortTx utxo tx
-    let event = OnAbortTx
-    let st' =
-          OnChainHeadState
-            { networkId
-            , peerVerificationKeys
-            , ownVerificationKey
-            , ownParty
-            , scriptRegistry
-            , stateMachine = Idle
-            }
-    pure (event, st')
-
---
--- StOpen
---
-
-instance HasTransition 'StOpen where
-  transitions _ =
-    [ TransitionTo (Proxy @ 'StClosed)
-    ]
-
-instance ObserveTx 'StOpen 'StClosed where
-  observeTx tx st@OnChainHeadState{networkId, peerVerificationKeys, ownVerificationKey, ownParty, stateMachine, scriptRegistry} = do
-    let utxo = getKnownUTxO st
-    observation <- observeCloseTx utxo tx
-    let CloseObservation{threadOutput, headId, snapshotNumber} = observation
-    guard (headId == openHeadId)
-    -- FIXME: The 0 here is a wart. We are in a pure function so we cannot easily compute with
-    -- time. We tried passing the current time from the caller but given the current machinery
-    -- around `observeSomeTx` this is actually not straightforward and quite ugly.
-    let event = OnCloseTx{snapshotNumber, remainingContestationPeriod = 0}
-    let st' =
-          OnChainHeadState
-            { networkId
-            , peerVerificationKeys
-            , ownVerificationKey
-            , ownParty
-            , scriptRegistry
-            , stateMachine =
-                Closed
-                  { closedThreadOutput = threadOutput
-                  , closedHeadId = headId
-                  , closedHeadTokenScript = openHeadTokenScript
-                  }
-            }
-    pure (event, st')
-   where
-    Open
-      { openHeadId
-      , openHeadTokenScript
-      } = stateMachine
-
---
--- StClosed
---
-
-instance HasTransition 'StClosed where
-  transitions _ =
-    [ TransitionTo (Proxy @ 'StIdle)
-    , TransitionTo (Proxy @ 'StClosed)
-    ]
-
-instance ObserveTx 'StClosed 'StIdle where
-  observeTx tx st@OnChainHeadState{networkId, peerVerificationKeys, ownVerificationKey, ownParty, scriptRegistry} = do
-    let utxo = getKnownUTxO st
-    FanoutObservation <- observeFanoutTx utxo tx
-    let event = OnFanoutTx
-    let st' =
-          OnChainHeadState
-            { networkId
-            , peerVerificationKeys
-            , ownVerificationKey
-            , ownParty
-            , scriptRegistry
-            , stateMachine = Idle
-            }
-    pure (event, st')
-
-instance ObserveTx 'StClosed 'StClosed where
-  observeTx tx st@OnChainHeadState{networkId, peerVerificationKeys, ownVerificationKey, ownParty, stateMachine, scriptRegistry} = do
-    let utxo = getKnownUTxO st
-    observation <- observeContestTx utxo tx
-    let ContestObservation{contestedThreadOutput, headId, snapshotNumber} = observation
-    guard (headId == closedHeadId)
-    let event = OnContestTx{snapshotNumber}
-    let st' =
-          OnChainHeadState
-            { networkId
-            , peerVerificationKeys
-            , ownVerificationKey
-            , ownParty
-            , scriptRegistry
-            , stateMachine =
-                Closed
-                  { closedThreadOutput = closedThreadOutput{closedThreadUTxO = contestedThreadOutput}
-                  , closedHeadId
-                  , closedHeadTokenScript
-                  }
-            }
-    pure (event, st')
-   where
-    Closed
-      { closedHeadId
-      , closedHeadTokenScript
-      , closedThreadOutput
-      } = stateMachine
-
--- | A convenient way to apply transition to 'SomeOnChainHeadState' without
--- bothering about the internal details.
-observeSomeTx ::
+-- | Observe an init transition using a 'InitialState' and 'observeInitTx'.
+observeInit ::
+  ChainContext ->
   Tx ->
-  SomeOnChainHeadState ->
-  Maybe (OnChainTx Tx, SomeOnChainHeadState)
-observeSomeTx tx (SomeOnChainHeadState (st :: OnChainHeadState st)) =
-  asum $ (\(TransitionTo st') -> observeSome st') <$> transitions (Proxy @st)
+  Maybe (OnChainTx Tx, InitialState)
+observeInit ctx tx = do
+  observation <- observeInitTx networkId (allVerificationKeys ctx) ownParty tx
+  pure (toEvent observation, toState observation)
  where
-  observeSome ::
-    forall st'.
-    (ObserveTx st st', HasTransition st') =>
-    Proxy st' ->
-    Maybe (OnChainTx Tx, SomeOnChainHeadState)
-  observeSome _ =
-    second SomeOnChainHeadState <$> observeTx @st @st' tx st
+  toEvent InitObservation{contestationPeriod, parties} =
+    OnInitTx{contestationPeriod, parties}
 
---
--- TransitionFrom
---
+  toState InitObservation{threadOutput, initials, commits, headId, headTokenScript} =
+    InitialState
+      { ctx
+      , initialThreadOutput = threadOutput
+      , initialInitials = initials
+      , initialCommits = commits
+      , initialHeadId = headId
+      , initialHeadTokenScript = headTokenScript
+      }
 
-data TransitionFrom st where
-  TransitionTo ::
-    forall st st'.
-    ( ObserveTx st st'
-    , HasTransition st'
-    , HeadStateKindVal st
-    , HeadStateKindVal st'
-    ) =>
-    Proxy st' ->
-    TransitionFrom st
+  ChainContext
+    { networkId
+    , ownParty
+    } = ctx
 
-instance Show (TransitionFrom st) where
-  show (TransitionTo proxy) =
-    mconcat
-      [ show (headStateKindVal (Proxy @st))
-      , " -> "
-      , show (headStateKindVal proxy)
-      ]
+-- ** InitialState transitions
 
-instance Eq (TransitionFrom st) where
-  (TransitionTo proxy) == (TransitionTo proxy') =
-    headStateKindVal proxy == headStateKindVal proxy'
+-- | Observe an commit transition using a 'InitialState' and 'observeCommitTx'.
+observeCommit ::
+  InitialState ->
+  Tx ->
+  Maybe (OnChainTx Tx, InitialState)
+observeCommit st tx = do
+  let initials = fst3 <$> initialInitials
+  observation <- observeCommitTx networkId initials tx
+  let CommitObservation{commitOutput, party, committed} = observation
+  let event = OnCommitTx{party, committed}
+  let st' =
+        st
+          { initialInitials =
+              -- NOTE: A commit tx has been observed and thus we can
+              -- remove all it's inputs from our tracked initials
+              filter ((`notElem` txIns' tx) . fst3) initialInitials
+          , initialCommits =
+              commitOutput : initialCommits
+          }
+  pure (event, st')
+ where
+  InitialState
+    { ctx = ChainContext{networkId}
+    , initialCommits
+    , initialInitials
+    } = st
 
---
--- Helpers
---
+-- | Observe an collect transition using a 'InitialState' and 'observeCollectComTx'.
+-- This function checks the head id and ignores if not relevant.
+observeCollect ::
+  InitialState ->
+  Tx ->
+  Maybe (OnChainTx Tx, OpenState)
+observeCollect st tx = do
+  let utxo = getKnownUTxO st
+  observation <- observeCollectComTx utxo tx
+  let CollectComObservation{threadOutput, headId, utxoHash} = observation
+  guard (headId == initialHeadId)
+  let event = OnCollectComTx
+  let st' =
+        OpenState
+          { ctx
+          , openThreadOutput = threadOutput
+          , openHeadId = initialHeadId
+          , openHeadTokenScript = initialHeadTokenScript
+          , openUtxoHash = utxoHash
+          }
+  pure (event, st')
+ where
+  InitialState
+    { ctx
+    , initialHeadId
+    , initialHeadTokenScript
+    } = st
+
+-- | Observe an abort transition using a 'InitialState' and 'observeAbortTx'.
+-- This function checks the head id and ignores if not relevant.
+observeAbort ::
+  InitialState ->
+  Tx ->
+  Maybe (OnChainTx Tx, IdleState)
+observeAbort st tx = do
+  let utxo = getKnownUTxO st
+  AbortObservation <- observeAbortTx utxo tx
+  let event = OnAbortTx
+  let st' = IdleState{ctx}
+  pure (event, st')
+ where
+  InitialState{ctx} = st
+
+-- ** OpenState transitions
+
+-- | Observe a close transition using a 'OpenState' and 'observeCloseTx'.
+-- This function checks the head id and ignores if not relevant.
+observeClose ::
+  OpenState ->
+  Tx ->
+  Maybe (OnChainTx Tx, ClosedState)
+observeClose st tx = do
+  let utxo = getKnownUTxO st
+  observation <- observeCloseTx utxo tx
+  let CloseObservation{threadOutput, headId, snapshotNumber} = observation
+  guard (headId == openHeadId)
+  let ClosedThreadOutput{closedContestationDeadline} = threadOutput
+  let event =
+        OnCloseTx
+          { snapshotNumber
+          , contestationDeadline = posixToUTCTime closedContestationDeadline
+          }
+  let st' =
+        ClosedState
+          { ctx
+          , closedThreadOutput = threadOutput
+          , closedHeadId = headId
+          , closedHeadTokenScript = openHeadTokenScript
+          }
+  pure (event, st')
+ where
+  OpenState
+    { ctx
+    , openHeadId
+    , openHeadTokenScript
+    } = st
+
+-- ** ClosedState transitions
+
+-- | Observe a fanout transition using a 'ClosedState' and 'observeContestTx'.
+-- This function checks the head id and ignores if not relevant.
+observeContest ::
+  ClosedState ->
+  Tx ->
+  Maybe (OnChainTx Tx, ClosedState)
+observeContest st tx = do
+  let utxo = getKnownUTxO st
+  observation <- observeContestTx utxo tx
+  let ContestObservation{contestedThreadOutput, headId, snapshotNumber} = observation
+  guard (headId == closedHeadId)
+  let event = OnContestTx{snapshotNumber}
+  let st' = st{closedThreadOutput = closedThreadOutput{closedThreadUTxO = contestedThreadOutput}}
+  pure (event, st')
+ where
+  ClosedState
+    { closedHeadId
+    , closedThreadOutput
+    } = st
+
+-- | Observe a fanout transition using a 'ClosedState' and 'observeFanoutTx'.
+observeFanout ::
+  ClosedState ->
+  Tx ->
+  Maybe (OnChainTx Tx, IdleState)
+observeFanout st tx = do
+  let utxo = getKnownUTxO st
+  FanoutObservation <- observeFanoutTx utxo tx
+  pure (OnFanoutTx, IdleState{ctx})
+ where
+  ClosedState{ctx} = st
+
+-- * Helpers
 
 fst3 :: (a, b, c) -> a
 fst3 (a, _b, _c) = a
