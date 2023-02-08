@@ -3,6 +3,8 @@
 
 module Hydra.Contract.Util where
 
+import Hydra.Cardano.Api (NetworkId (Mainnet, Testnet))
+import qualified Hydra.Cardano.Api.Network as Network
 import Plutus.V1.Ledger.Value (isZero)
 import Plutus.V2.Ledger.Api (
   CurrencySymbol,
@@ -56,3 +58,8 @@ infix 4 ===
 (===) val val' =
   serialiseData (toBuiltinData val) == serialiseData (toBuiltinData val')
 {-# INLINEABLE (===) #-}
+
+-- | Convert Cardano.Api 'NetworkId' to ledger `Network`
+networkIdToNetwork :: NetworkId -> Network.Network
+networkIdToNetwork Mainnet = Network.Mainnet
+networkIdToNetwork (Testnet _) = Network.Testnet
