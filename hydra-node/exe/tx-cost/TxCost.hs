@@ -10,8 +10,6 @@ import Data.Maybe (fromJust)
 import Hydra.Cardano.Api (
   ExecutionUnits (..),
   Lovelace,
-  NetworkId (Testnet),
-  NetworkMagic (NetworkMagic),
   Tx,
   UTxO,
  )
@@ -248,5 +246,3 @@ checkSizeAndEvaluate tx knownUTxO = do
  where
   txSize = fromIntegral $ LBS.length $ serialize tx
 
-networkId :: NetworkId
-networkId = Testnet $ NetworkMagic 42
