@@ -53,6 +53,8 @@ changes.
 
 - Hydra node can start following the chain from _genesis_ by setting `--start-chain-from 0` at startup time
 
+- Hydra node can now parse `Mainnet` network command line argument.
+
 - Introducing `NoFuelUTXOFound` error. Previously the node would fail with
   `NotEnoughFuel` when utxo was not found. Now `NotEnoughFuel` is used when
   there is not enough fuel and `NoFuelUTXOFound` when utxo was not to be found.
